@@ -1,0 +1,15 @@
+venv/
+__pycache__/
+*.pyc
+
+data/raw_scraped/
+data/processed/
+models/
+*.db
+
+.vscode/
+
+.ipynb_checkpoints/
+
+.env
+
