@@ -13,3 +13,4 @@ models/
 
 .env
 
+telegram_session.session
