@@ -37,12 +37,12 @@ def label_data(input_file, output_file, num_samples):
     for i, message in enumerate(messages_to_label):
         clear_screen()
         print(f"--- Labeling Message {i + 1} of {num_samples} ---")
-        print(f"\nMessage: {message}\n")
         
         tokens = message.split()
         current_message_labels = []
         
         for token in tokens:
+            print(f"\nMessage: {message}\n")
             print_label_menu(label_menu)
             print(f"Current Token: '{token}'")
             
