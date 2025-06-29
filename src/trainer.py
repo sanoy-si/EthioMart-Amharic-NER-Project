@@ -1,5 +1,6 @@
 import os
-from datasets import load_dataset, DatasetDict
+import numpy as np
+from datasets import Dataset, DatasetDict, ClassLabel, Sequence
 from transformers import (
     AutoTokenizer,
     AutoModelForTokenClassification,
@@ -7,40 +8,56 @@ from transformers import (
     Trainer,
     DataCollatorForTokenClassification,
 )
-import numpy as np
 from seqeval.metrics import f1_score, precision_score, recall_score, classification_report
 
-MODEL_CHECKPOINT = "Davlan/afro-xlm-roberta-base" 
-DATA_DIR = "data_splits"
-OUTPUT_DIR = f"ethio-ner-{MODEL_CHECKPOINT.split('/')[-1]}"
 
-print(f"[*] Loading raw text datasets from '{DATA_DIR}'...")
-data_files = {
-    "train": os.path.join(DATA_DIR, "train.conll"),
-    "validation": os.path.join(DATA_DIR, "validation.conll"),
-    "test": os.path.join(DATA_DIR, "test.conll"),
-}
-raw_datasets = load_dataset("text", data_files=data_files)
-print("\n[*] Text files loaded successfully:", raw_datasets)
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
 
-def get_label_list(file_path):
-    labels = set()
-    with open(file_path, 'r', encoding='utf-8') as f:
-        for line in f:
-            if line.strip(): # not an empty line
+DATA_DIR = os.path.join(PROJECT_ROOT, "data", "data_splits")
+MODEL_CHECKPOINT = "xlm-roberta-base"
+MODELS_OUTPUT_DIR = os.path.join(PROJECT_ROOT, "models", f"ethio-ner-{MODEL_CHECKPOINT.split('/')[-1]}")
+
+def load_conll_file(file_path):
+    """Reads a CoNLL-formatted file and yields examples as dictionaries."""
+    with open(file_path, "r", encoding="utf-8") as f:
+        tokens, tags = [], []
+        all_lines = f.readlines()
+        for line in all_lines:
+            line = line.strip()
+            if line:
                 parts = line.split()
-                if len(parts) > 1:
-                    labels.add(parts[1])
-    return sorted(list(labels))
+                if len(parts) >= 2:
+                    tokens.append(parts[0])
+                    tags.append(parts[-1]) 
+            elif tokens:
+                yield {"tokens": tokens, "ner_tags": tags}
+                tokens, tags = [], []
+        if tokens: 
+            yield {"tokens": tokens, "ner_tags": tags}
 
-print("\n[*] Inferring labels from the training data...")
-label_list = get_label_list(data_files["train"])
+train_data = list(load_conll_file(os.path.join(DATA_DIR, "train.conll")))
+validation_data = list(load_conll_file(os.path.join(DATA_DIR, "validation.conll")))
+test_data = list(load_conll_file(os.path.join(DATA_DIR, "test.conll")))
+
+all_tags = set(tag for example in train_data for tag in example["ner_tags"])
+label_list = sorted(list(all_tags))
 label2id = {label: i for i, label in enumerate(label_list)}
-id2label = {i: label for i, label in enumerate(label_list)}
+id2label = {i: l for i, l in enumerate(label_list)}
 num_labels = len(label_list)
-print(f"  Label List: {label_list}")
-print(f"  Number of Labels: {num_labels}")
+print(f"[*] Inferred Labels: {label_list}")
 
+raw_datasets = DatasetDict({
+    "train": Dataset.from_list(train_data),
+    "validation": Dataset.from_list(validation_data),
+    "test": Dataset.from_list(test_data)
+})
+
+ner_feature = Sequence(feature=ClassLabel(names=label_list))
+raw_datasets = raw_datasets.cast_column("ner_tags", ner_feature)
+
+print("\n[*] Dataset loaded and parsed successfully:")
+print(raw_datasets)
 
 print(f"\n[*] Initializing tokenizer and model for '{MODEL_CHECKPOINT}'...")
 tokenizer = AutoTokenizer.from_pretrained(MODEL_CHECKPOINT)
@@ -51,16 +68,6 @@ model = AutoModelForTokenClassification.from_pretrained(
     id2label=id2label,
     label2id=label2id,
 )
-
-def parse_conll_examples(example):
-    lines = example['text'].strip().split('\n')
-    tokens, tags = [], []
-    for line in lines:
-        parts = line.split()
-        if len(parts) == 2:
-            tokens.append(parts[0])
-            tags.append(label2id[parts[1]]) # Convert tags to IDs
-    return {'tokens': tokens, 'ner_tags': tags}
 
 def tokenize_and_align_labels(examples):
     tokenized_inputs = tokenizer(examples["tokens"], truncation=True, is_split_into_words=True)
@@ -81,19 +88,15 @@ def tokenize_and_align_labels(examples):
     tokenized_inputs["labels"] = labels
     return tokenized_inputs
 
-print("\n[*] Applying preprocessing to the dataset...")
-# Step 1: Parse the CoNLL structure
-processed_datasets = raw_datasets.map(parse_conll_examples, remove_columns=['text'])
-# Step 2: Tokenize and align the labels
-tokenized_datasets = processed_datasets.map(
+print("\n[*] Applying tokenization and label alignment...")
+tokenized_datasets = raw_datasets.map(
     tokenize_and_align_labels,
     batched=True,
-    remove_columns=processed_datasets["train"].column_names
+    remove_columns=raw_datasets["train"].column_names
 )
 print("[+] Preprocessing complete.")
 print("\nFinal tokenized dataset format:")
 print(tokenized_datasets)
-
 
 def compute_metrics(p):
     predictions, labels = p
@@ -115,17 +118,22 @@ def compute_metrics(p):
 data_collator = DataCollatorForTokenClassification(tokenizer=tokenizer)
 
 training_args = TrainingArguments(
-    output_dir=OUTPUT_DIR,
+    output_dir=MODELS_OUTPUT_DIR,
     learning_rate=2e-5,
     per_device_train_batch_size=8,
     per_device_eval_batch_size=8,
     num_train_epochs=5,
     weight_decay=0.01,
-    evaluation_strategy="epoch",
-    save_strategy="epoch",
+    
+    eval_strategy="steps",
+    eval_steps=3,     
+    save_strategy="steps",
+    save_steps=3,     
+    
+    logging_steps=10,              
     load_best_model_at_end=True,
-    push_to_hub=False,
     metric_for_best_model="f1",
+    push_to_hub=False,
 )
 
 trainer = Trainer(
@@ -138,7 +146,7 @@ trainer = Trainer(
     compute_metrics=compute_metrics,
 )
 
-print(f"\n[*] Starting training... Model will be saved to '{OUTPUT_DIR}'")
+print(f"\n[*] Starting training... Model will be saved to '{MODELS_OUTPUT_DIR}'")
 trainer.train()
 
 print("\n[*] Evaluating the best model on the test set...")
@@ -163,7 +171,7 @@ true_labels = [
 print("\n--- Classification Report on Test Set ---")
 print(classification_report(true_labels, true_predictions))
 
-BEST_MODEL_DIR = f"{OUTPUT_DIR}/best-model"
+BEST_MODEL_DIR = os.path.join(MODELS_OUTPUT_DIR, "best-model")
 print(f"\n[+] Saving the best model and tokenizer to '{BEST_MODEL_DIR}'...")
 trainer.save_model(BEST_MODEL_DIR)
 tokenizer.save_pretrained(BEST_MODEL_DIR)
